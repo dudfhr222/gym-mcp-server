@@ -303,27 +303,55 @@ app.get("/sse", async (req, res) => {
  * - 없으면 503 + Retry-After로 재시도 유도
  */
 app.post("/messages", async (req, res) => {
-  const sidHeader = req.headers["mcp-session-id"];
-  const sid = sidHeader ? String(sidHeader) : null;
+  const querySidRaw = req.query?.sessionId;
+  const querySid = Array.isArray(querySidRaw) ? querySidRaw[0] : querySidRaw;
+
+  const sidHeaderRaw = req.headers["mcp-session-id"];
+  const sidHeader = Array.isArray(sidHeaderRaw) ? sidHeaderRaw[0] : sidHeaderRaw;
+
+  const bodySidRaw =
+    req.body && typeof req.body === "object"
+      ? (req.body.sessionId ?? req.body.session_id)
+      : null;
+
+  // SSE(legacy) = query.sessionId, Streamable HTTP = mcp-session-id header
+  const sid =
+    querySid != null ? String(querySid) :
+    sidHeader != null ? String(sidHeader) :
+    bodySidRaw != null ? String(bodySidRaw) :
+    null;
 
   console.log("[HTTP] POST /messages", {
+    querySid: querySid ?? null,
+    headerSid: sidHeader ?? null,
+    bodySid: bodySidRaw ?? null,
+    resolvedSid: sid,
     sid,
     sessions: sseSessions.size,
     lastSseSid,
   });
 
   try {
-    // 1) sid로 매칭
-    if (sid && sseSessions.has(sid)) {
-      return await sseSessions.get(sid).transport.handlePostMessage(req, res);
+    // 1) Explicit sid routing first. If provided but unknown, do not fallback.
+    if (sid) {
+      if (sseSessions.has(sid)) {
+        return await sseSessions.get(sid).transport.handlePostMessage(req, res, req.body);
+      }
+
+      res.setHeader("Retry-After", "1");
+      return res.status(404).json({
+        error: "Session not found for provided sid.",
+        got_sid: sid,
+        known: Array.from(sseSessions.keys()),
+      });
     }
 
-    // 2) fallback: 마지막 sid
+    // 2) Fallback only when sid is completely missing.
     if (lastSseSid && sseSessions.has(lastSseSid)) {
-      return await sseSessions.get(lastSseSid).transport.handlePostMessage(req, res);
+      return await sseSessions.get(lastSseSid).transport.handlePostMessage(req, res, req.body);
     }
 
-    // 3) 그래도 없으면 재시도 유도
+    // 3) Nothing active: ask client to retry after opening /sse
     res.setHeader("Retry-After", "1");
     return res.status(503).json({
       error: "No active SSE session. Call /sse first or retry.",
